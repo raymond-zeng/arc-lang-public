@@ -33,7 +33,7 @@ class Challenge(BaseModel):
         solutions: list[GRID] = None,
         test_attempts: list[GRID] = None,
     ) -> None:
-        from viz import viz_many
+        from src.viz import viz_many
 
         if train_attempts:
             assert len(train_attempts) == len(self.train)

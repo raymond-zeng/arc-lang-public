@@ -136,9 +136,24 @@ openrouter_client = AsyncOpenAI(
     timeout=2500,
     max_retries=2,
 )
-gemini_client = genai.Client(
-    api_key=os.environ["GEMINI_API_KEY"],
-)
+
+# Initialize Gemini client - supports both Vertex AI and free tier
+# If GOOGLE_CLOUD_PROJECT is set, uses Vertex AI (better rate limits)
+# Otherwise falls back to GEMINI_API_KEY (free tier)
+gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+
+if gcp_project:
+    # Use Vertex AI backend (recommended for production)
+    gemini_client = genai.Client(
+        vertexai=True,
+        project=gcp_project,
+        location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+    )
+else:
+    # Fall back to free tier API
+    gemini_client = genai.Client(
+        api_key=os.environ.get("GEMINI_API_KEY", ""),
+    )
 
 # Semaphore to limit concurrent API calls to 100
 API_SEMAPHORE = MonitoredSemaphore(
@@ -797,6 +812,7 @@ async def _get_next_structure_openrouter(
         raise Exception(f"Failed to parse JSON response: {e}\nResponse: {content}")
 
 
+@retry_with_backoff(max_retries=20)
 async def _get_next_structure_gemini(
     structure: type[BMType],  # type[T]
     model: Model,
@@ -805,24 +821,33 @@ async def _get_next_structure_gemini(
     # Convert messages to Gemini format
     prompt = update_messages_gemini(messages=messages)
 
-    # Generate content with structured output
-    response = await asyncio.to_thread(
-        gemini_client.models.generate_content,
-        model=model.value,
-        contents=prompt,
-        config={
-            "response_mime_type": "application/json",
-            "response_schema": structure,
-        },
-    )
+    # Use the modern genai.Client which supports both Vertex AI and free tier
+    # The client was configured at initialization to use Vertex AI if GOOGLE_CLOUD_PROJECT is set
+    # Wrap with timeout to prevent hanging indefinitely
+    timeout_seconds = 3600  # 1 hour timeout
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                gemini_client.models.generate_content,
+                model=model.value,
+                contents=prompt,
+                config={
+                    "temperature": 1,
+                    "max_output_tokens": 65536,  # Increased from 8192 to support complex instructions
+                    "response_mime_type": "application/json",
+                    "response_schema": structure,
+                },
+            ),
+            timeout=timeout_seconds
+        )
+    except asyncio.TimeoutError:
+        raise Exception(f"Gemini API call timed out after {timeout_seconds} seconds")
 
     # The response.parsed should contain the instantiated object
     if hasattr(response, "parsed") and response.parsed:
         return response.parsed
 
     # Fallback to parsing the text response
-    import json
-
     content = response.text
     if not content:
         raise Exception("Empty response from Gemini model")
