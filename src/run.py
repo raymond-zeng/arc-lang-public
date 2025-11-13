@@ -762,9 +762,23 @@ async def get_answer_grids(*, c: Challenge, config: RunConfig) -> tuple[Guess, G
 class ChallengeSolution(BaseModel):
     attempt_1: GRID
     attempt_2: GRID
+    instructions_1: str | None = None
+    instructions_2: str | None = None
+
+
+class CorrectSolution(BaseModel):
+    """Stores a correctly solved puzzle with its instructions."""
+    task_id: str
+    train: list[Example]
+    test: list[Input]
+    solution: GRID
+    correct_attempt: GRID
+    instructions: str
+    attempt_number: int  # 1 or 2, indicating which attempt was correct
 
 
 SOLUTIONS_D: dict[str, list[ChallengeSolution]] = {}
+CORRECT_SOLUTIONS: list[CorrectSolution] = []
 
 
 def evaluate_solutions(
@@ -809,11 +823,20 @@ async def solve_challenge(
         first_guess_obj, second_guess_obj = await get_answer_grids(c=c, config=config)
     # now write these to attempts path
 
+    # Extract instructions from guess objects (fallback to guess object's instructions_score if needed)
+    # Note: Each test input may have different instructions, but Guess object only stores one
+    # We'll use the instructions from the guess object for all tests (as per current design)
+    instructions_1 = first_guess_obj.instructions_score.instructions if first_guess_obj.instructions_score else None
+    instructions_2 = second_guess_obj.instructions_score.instructions if second_guess_obj.instructions_score else None
+
     challenge_solutions: list[ChallengeSolution] = []
     for i in range(len(c.test)):
         challenge_solutions.append(
             ChallengeSolution(
-                attempt_1=first_guess_obj.grids[i], attempt_2=second_guess_obj.grids[i]
+                attempt_1=first_guess_obj.grids[i], 
+                attempt_2=second_guess_obj.grids[i],
+                instructions_1=instructions_1,
+                instructions_2=instructions_2,
             )
         )
     SOLUTIONS_D[c.task_id] = challenge_solutions
@@ -843,6 +866,22 @@ async def solve_challenge(
                     correct += 1
                     log.debug(f"Grid {i} matches")
                     guess_scores.append(1)
+                    
+                    # Store correctly solved puzzle
+                    attempt_num = 1 if guess_obj == first_guess_obj else 2
+                    correct_instructions = instructions_1 if attempt_num == 1 else instructions_2
+                    
+                    if correct_instructions:
+                        correct_solution = CorrectSolution(
+                            task_id=c.task_id,
+                            train=c.train,
+                            test=[c.test[i]],  # Store only the test input that was solved correctly
+                            solution=solution_grid,
+                            correct_attempt=answer_grid,
+                            instructions=correct_instructions,
+                            attempt_number=attempt_num,
+                        )
+                        CORRECT_SOLUTIONS.append(correct_solution)
                 else:
                     if os.getenv("LOG_GRIDS", "0") == "1":
                         log.debug(
@@ -934,8 +973,9 @@ async def run_from_json(
     offset: int = 0,
     task_ids: set[str] | None = None,
 ) -> None:
-    global SOLUTIONS_D
+    global SOLUTIONS_D, CORRECT_SOLUTIONS
     SOLUTIONS_D = {}
+    CORRECT_SOLUTIONS = []  # Reset correct solutions list for this run
 
     run_id = generate_run_id()
     print(f"\n{'=' * 50}")
@@ -982,6 +1022,22 @@ async def run_from_json(
             temp_attempts_dir=temp_attempts_dir,
         )
         log.info("Run completed", final_scores=final_scores)
+        
+        # Write correct solutions to JSON file
+        if CORRECT_SOLUTIONS:
+            # Generate filename: correct_solutions_arc-agi_evaluation.json
+            base_name = attempts_path.stem  # e.g., "arc-agi_evaluation_attempts"
+            # Remove "_attempts" suffix if present
+            if base_name.endswith("_attempts"):
+                base_name = base_name[:-9]  # Remove "_attempts"
+            correct_solutions_path = attempts_path.parent / f"correct_solutions_{base_name}.json"
+            open(correct_solutions_path, "w").write(
+                TypeAdapter(list[CorrectSolution])
+                .dump_json(CORRECT_SOLUTIONS)
+                .decode("utf-8")
+            )
+            print(f"\nSaved {len(CORRECT_SOLUTIONS)} correctly solved puzzles to: {correct_solutions_path}")
+            log.info("Correct solutions saved", count=len(CORRECT_SOLUTIONS), path=str(correct_solutions_path))
 
 
 async def run() -> None:
